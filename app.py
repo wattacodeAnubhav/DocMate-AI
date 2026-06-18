@@ -320,8 +320,8 @@ with st.sidebar:
     st.header("Document Library")
         
     uploaded_files = st.file_uploader(
-        "Upload workspace PDFs", 
-        type=["pdf"], 
+        "Upload workspace PDFs & CSVs", 
+        type=["pdf", "csv"], 
         accept_multiple_files=True
     )
     
@@ -367,27 +367,30 @@ with st.sidebar:
                 with open(temp_path, "wb") as f:
                     f.write(uploaded_file.getvalue())
                 
-                with fitz.open(temp_path) as doc:
-                    total_pages = len(doc)
-                
-                def update_progress(pages_processed):
-                    progress_val = min(pages_processed / total_pages, 1.0)
-                    progress_bar.progress(progress_val)
-                
-                # 2. Process and Embed ONE BATCH AT A TIME to save RAM
-                for batch_chunks in process_document_pipeline(temp_path, progress_callback=update_progress):
-                    if batch_chunks:
-                        populate_vector_store(batch_chunks)
+                # 2. Process the file based on its type (PDF or CSV)
+                if uploaded_file.name.endswith(".pdf"):
+                    with fitz.open(temp_path) as doc:
+                        total_pages = len(doc)
+                    
+                    def update_progress(pages_processed):
+                        progress_val = min(pages_processed / total_pages, 1.0)
+                        progress_bar.progress(progress_val)
+                    
+                    for batch_chunks in process_document_pipeline(temp_path, progress_callback=update_progress):
+                        if batch_chunks:
+                            populate_vector_store(batch_chunks)
+                        del batch_chunks
+                        gc.collect()
                         
-                    # Explicitly free local memory after vector DB insertion
-                    del batch_chunks
-                    gc.collect()
+                elif uploaded_file.name.endswith(".csv"):
+                    from modules.database import load_csv_to_sqlite
+                    load_csv_to_sqlite(temp_path, uploaded_file.name)
+                    progress_bar.progress(1.0)
+                # --------------------------------------------
                 
                 # 3. Cleanup
                 progress_bar.empty()
                 st.session_state.processed_files.add(uploaded_file.name)
-                
-        st.toast(f"✅ Library updated: {len(st.session_state.processed_files)} document(s) active.")
         
 # ==========================================
 # 4. HELPER FUNCTION: RENDER DYNAMIC DASHBOARD
@@ -579,6 +582,11 @@ for idx, message in enumerate(st.session_state.conversation_memory):
                     render_dashboard_component(h_payload, message_idx=idx) 
             
             elif h_intent == "TABULAR_SQL":
+                # Render historical DataFrame
+                if "sql_data" in message["visual_payload"]:
+                    df = pd.DataFrame(message["visual_payload"]["sql_data"])
+                    st.dataframe(df, use_container_width=True)
+                    
                 with st.expander("🗄️ View Generated SQL Plan", expanded=False):
                     st.code(h_payload, language="sql")
 
@@ -723,12 +731,36 @@ if user_query := st.chat_input("Ask a question, or use commands: /dash, /flow, /
                 response_payload = generate_chained_report(task_query, context_chunks)
                 status.update(label="Chained execution complete!", state="complete", expanded=False)
                 
-        elif is_sql: # This triggers a specialized agent that evaluates the user's SQL query against a mocked database schema, and generates an execution plan. In a production system, this would connect to a real database and use the schema and metadata to inform the SQL generation.
+        elif is_sql:
             sql_query = user_query.replace("/sql ", "").strip()
-            with st.status("🗄️ Routing to Tabular Data Agent...", expanded=True) as status:
-                mock_schema = "Table: finance_records (id, quarter, revenue, operating_cost, segment)"
-                response_payload = generate_tabular_response(sql_query, mock_schema)
-                status.update(label="SQL execution plan formulated!", state="complete", expanded=False)
+            with st.status("🗄️ Querying Live Database...", expanded=True) as status:
+                from modules.database import get_db_schema, execute_sql
+                
+                real_schema = get_db_schema()
+                if "No tables available." in real_schema or "No database found" in real_schema:
+                    status.update(label="Database Empty", state="error")
+                    st.error("Please upload a CSV file to the library before running SQL queries.")
+                    st.stop()
+                    
+                # Ask the LLM to generate the SQL based on the REAL schema
+                response_payload = generate_tabular_response(sql_query, real_schema)
+                
+                if response_payload.get("intent") == "TABULAR_SQL":
+                    # Clean the markdown wrappers the LLM sometimes adds
+                    clean_sql = response_payload["payload"].replace("```sql", "").replace("```", "").strip()
+                    
+                    # Execute against SQLite
+                    df_result, error = execute_sql(clean_sql)
+                    
+                    if error:
+                        response_payload["payload"] = f"SQL Execution Error: {error}\n\nGenerated SQL:\n```sql\n{clean_sql}\n```"
+                        response_payload["intent"] = "ERROR"
+                    else:
+                        # Convert DataFrame to a dictionary so it can be saved in session_state memory
+                        response_payload["sql_data"] = df_result.to_dict('records') 
+                        response_payload["payload"] = clean_sql
+                        
+                status.update(label="SQL execution complete!", state="complete", expanded=False)
                 
         else: # For standard queries that require retrieval from the document vector space, we perform the retrieval and then pass the chunks to the LLM for response generation. The LLM will use the retrieved context to formulate a comprehensive answer, and the intent override allows us to steer the response format if the user used a command.
             with st.status("📚 Querying Document Vector Space...", expanded=True) as status:
@@ -810,12 +842,24 @@ if user_query := st.chat_input("Ask a question, or use commands: /dash, /flow, /
                 assistant_record["visual_payload"] = {"intent": intent, "payload": payload}
                 
             elif intent == "TABULAR_SQL":
-                text_intro = "I have evaluated the database schema and compiled the requested SQL execution plan."
+                text_intro = "I have generated and executed the SQL plan based on your uploaded CSV data."
                 st.markdown(text_intro)
-                with st.expander("🗄️ View Generated SQL Plan", expanded=True):
+                
+                # 1. Render the live DataFrame
+                if "sql_data" in response_payload:
+                    df = pd.DataFrame(response_payload["sql_data"])
+                    st.dataframe(df, use_container_width=True)
+                
+                # 2. Keep the SQL code visible in an expander for auditing
+                with st.expander("🗄️ View Generated SQL Plan", expanded=False):
                     st.code(payload, language="sql")
+                    
                 assistant_record["content"] = text_intro
-                assistant_record["visual_payload"] = {"intent": intent, "payload": payload}
+                assistant_record["visual_payload"] = {
+                    "intent": intent, 
+                    "payload": payload,
+                    "sql_data": response_payload.get("sql_data", [])
+                }
             
             elif intent == "VISUAL_GRAPH":
                 mermaid_string = "graph TD\n"
