@@ -1,0 +1,22 @@
+# Credentials and Environment Configurations
+.env
+.env.local
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Vector Storage & Cache DBs
+chroma_db/
+.chroma/
+
+# Python Internal Performance Cache
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Operating System System Files
+.DS_Store
+Thumbs.db
